@@ -73,12 +73,6 @@ router.post('/vega-checkout', async (req, res) => {
       transactionId,
     });
 
-    // Aqui você pode adicionar lógica adicional, como:
-    // - Enviar email de confirmação
-    // - Registrar no sistema de CRM
-    // - Disparar notificação ao admin
-    // - Iniciar processo de entrega
-
     res.json({
       success: true,
       message: 'Webhook processed successfully',
