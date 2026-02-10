@@ -28,7 +28,6 @@ export const appRouter = router({
         const db = await getDb();
         if (!db) throw new Error('Database not available');
 
-        // Criar cliente
         const customerResult = await db.insert(customers).values({
           name: input.customerName,
           email: input.customerEmail,
@@ -43,7 +42,6 @@ export const appRouter = router({
 
         const customerId = (customerResult as any).insertId as number;
 
-        // Criar pedido (R$ 149,90 = 14990 centavos)
         const unitPrice = 14990;
         const totalPrice = unitPrice * input.quantity;
         const orderResult = await db.insert(orders).values({
