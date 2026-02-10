@@ -1,102 +1,168 @@
-// Preconfigured storage helpers for Manus WebDev templates
-// Uses the Biz-provided storage proxy (Authorization: Bearer <token>)
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { publicProcedure, router, protectedProcedure } from "./_core/trpc";
+import { z } from "zod";
+import { getDb } from "./db";
+import { customers, orders, paymentHistory } from "../drizzle/schema";
+import { eq } from "drizzle-orm";
+import { COOKIE_NAME } from "../shared/const";
 
-import { ENV } from './_core/env';
+export const appRouter = router({
+  system: systemRouter,
+  
+  checkout: router({
+    createOrder: publicProcedure
+      .input(z.object({
+        customerName: z.string(),
+        customerEmail: z.string().email(),
+        customerPhone: z.string(),
+        street: z.string(),
+        number: z.string(),
+        city: z.string(),
+        state: z.string(),
+        zipCode: z.string(),
+        complement: z.string().optional(),
+        quantity: z.number().default(1),
+      }))
+      .mutation(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new Error('Database not available');
 
-type StorageConfig = { baseUrl: string; apiKey: string };
+        // Criar cliente
+        const customerResult = await db.insert(customers).values({
+          name: input.customerName,
+          email: input.customerEmail,
+          phone: input.customerPhone,
+          street: input.street,
+          number: input.number,
+          city: input.city,
+          state: input.state,
+          zipCode: input.zipCode,
+          complement: input.complement || '',
+        });
 
-function getStorageConfig(): StorageConfig {
-  const baseUrl = ENV.forgeApiUrl;
-  const apiKey = ENV.forgeApiKey;
+        const customerId = (customerResult as any).insertId as number;
 
-  if (!baseUrl || !apiKey) {
-    throw new Error(
-      "Storage proxy credentials missing: set BUILT_IN_FORGE_API_URL and BUILT_IN_FORGE_API_KEY"
-    );
-  }
+        // Criar pedido (R$ 149,90 = 14990 centavos)
+        const unitPrice = 14990;
+        const totalPrice = unitPrice * input.quantity;
+        const orderResult = await db.insert(orders).values({
+          customerId: customerId,
+          quantity: input.quantity,
+          unitPrice: unitPrice,
+          totalPrice: totalPrice,
+          status: 'pending',
+        });
 
-  return { baseUrl: baseUrl.replace(/\/+$/, ""), apiKey };
-}
+        const orderId = (orderResult as any).insertId as number;
 
-function buildUploadUrl(baseUrl: string, relKey: string): URL {
-  const url = new URL("v1/storage/upload", ensureTrailingSlash(baseUrl));
-  url.searchParams.set("path", normalizeKey(relKey));
-  return url;
-}
+        return {
+          orderId: orderId,
+          customerId: customerId,
+          totalPrice: totalPrice / 100,
+          vegaCheckoutUrl: `https://checkout.vegacheckout.com.br?orderId=${orderId}&amount=${totalPrice}`,
+        };
+      } ),
+  }),
 
-async function buildDownloadUrl(
-  baseUrl: string,
-  relKey: string,
-  apiKey: string
-): Promise<string> {
-  const downloadApiUrl = new URL(
-    "v1/storage/downloadUrl",
-    ensureTrailingSlash(baseUrl)
-  );
-  downloadApiUrl.searchParams.set("path", normalizeKey(relKey));
-  const response = await fetch(downloadApiUrl, {
-    method: "GET",
-    headers: buildAuthHeaders(apiKey),
-  });
-  return (await response.json()).url;
-}
+  auth: router({
+    me: publicProcedure.query(opts => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return {
+        success: true,
+      } as const;
+    }),
+  }),
 
-function ensureTrailingSlash(value: string): string {
-  return value.endsWith("/") ? value : `${value}/`;
-}
+  dashboard: router({
+    kpis: protectedProcedure.query(async () => {
+      const db = await getDb();
+      if (!db) throw new Error('Database not available');
 
-function normalizeKey(relKey: string): string {
-  return relKey.replace(/^\/+/, "");
-}
+      const totalOrders = await db.select().from(orders);
+      const paidOrders = totalOrders.filter(o => o.status === 'paid');
+      const pendingOrders = totalOrders.filter(o => o.status === 'pending');
+      const totalRevenue = paidOrders.reduce((sum, o) => sum + o.totalPrice, 0);
 
-function toFormData(
-  data: Buffer | Uint8Array | string,
-  contentType: string,
-  fileName: string
-): FormData {
-  const blob =
-    typeof data === "string"
-      ? new Blob([data], { type: contentType })
-      : new Blob([data as any], { type: contentType });
-  const form = new FormData();
-  form.append("file", blob, fileName || "file");
-  return form;
-}
+      return {
+        totalOrders: totalOrders.length,
+        paidOrders: paidOrders.length,
+        pendingOrders: pendingOrders.length,
+        totalRevenue: totalRevenue / 100,
+        averageOrderValue: paidOrders.length > 0 ? (totalRevenue / paidOrders.length) / 100 : 0,
+      };
+    }),
 
-function buildAuthHeaders(apiKey: string): HeadersInit {
-  return { Authorization: `Bearer ${apiKey}` };
-}
+    sales: protectedProcedure
+      .input(z.object({
+        limit: z.number().default(50),
+        offset: z.number().default(0),
+      }))
+      .query(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new Error('Database not available');
 
-export async function storagePut(
-  relKey: string,
-  data: Buffer | Uint8Array | string,
-  contentType = "application/octet-stream"
-): Promise<{ key: string; url: string }> {
-  const { baseUrl, apiKey } = getStorageConfig();
-  const key = normalizeKey(relKey);
-  const uploadUrl = buildUploadUrl(baseUrl, key);
-  const formData = toFormData(data, contentType, key.split("/").pop() ?? key);
-  const response = await fetch(uploadUrl, {
-    method: "POST",
-    headers: buildAuthHeaders(apiKey),
-    body: formData,
-  });
+        const paidOrders = await db.select().from(orders).where(eq(orders.status, 'paid'));
+        const ordersWithCustomers = await Promise.all(
+          paidOrders.map(async (order) => {
+            const customer = await db.select().from(customers).where(eq(customers.id, order.customerId)).limit(1);
+            return {
+              ...order,
+              customer: customer[0],
+            };
+          })
+        );
 
-  if (!response.ok) {
-    const message = await response.text().catch(() => response.statusText);
-    throw new Error(
-      `Storage upload failed (${response.status} ${response.statusText}): ${message}`
-    );
-  }
-  const url = (await response.json()).url;
-  return { key, url };
-}
+        return ordersWithCustomers.slice(input.offset, input.offset + input.limit);
+      }),
 
-export async function storageGet(relKey: string): Promise<{ key: string; url: string; }> {
-  const { baseUrl, apiKey } = getStorageConfig();
-  const key = normalizeKey(relKey);
-  return {
-    key,
-    url: await buildDownloadUrl(baseUrl, key, apiKey),
-  };
-}
+    customersList: protectedProcedure
+      .input(z.object({
+        limit: z.number().default(50),
+        offset: z.number().default(0),
+      }))
+      .query(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new Error('Database not available');
+
+        const allCustomers = await db.select().from(customers);
+        const customersWithOrders = await Promise.all(
+          allCustomers.map(async (customer) => {
+            const customerOrders = await db.select().from(orders).where(eq(orders.customerId, customer.id));
+            return {
+              ...customer,
+              totalOrders: customerOrders.length,
+              totalSpent: customerOrders.reduce((sum, o) => sum + o.totalPrice, 0) / 100,
+            };
+          })
+        );
+
+        return customersWithOrders.slice(input.offset, input.offset + input.limit);
+      }),
+
+    abandonedCarts: protectedProcedure
+      .input(z.object({
+        limit: z.number().default(50),
+        offset: z.number().default(0),
+      }))
+      .query(async ({ input }) => {
+        const db = await getDb();
+        if (!db) throw new Error('Database not available');
+
+        const pendingOrders = await db.select().from(orders).where(eq(orders.status, 'pending'));
+        const ordersWithCustomers = await Promise.all(
+          pendingOrders.map(async (order) => {
+            const customer = await db.select().from(customers).where(eq(customers.id, order.customerId)).limit(1);
+            return {
+              ...order,
+              customer: customer[0],
+            };
+          })
+        );
+
+        return ordersWithCustomers.slice(input.offset, input.offset + input.limit);
+      }),
+  }),
+});
